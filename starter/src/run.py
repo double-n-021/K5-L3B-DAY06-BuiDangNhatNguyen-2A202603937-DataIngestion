@@ -1,4 +1,4 @@
-"""Main pipeline entry point for Day 06 Data Ingestion Engineering."""
+"""Suggested pipeline entry point."""
 import hashlib
 import json
 import os
@@ -21,6 +21,7 @@ REPO_ROOT = STARTER_DIR.parent
 
 
 def _compute_chunk_stats(chunks: list[Chunk]) -> dict[str, Any]:
+    """Tính thống kê số lượng và phân phối độ dài chunk cho từng chiến lược."""
     lengths = [len(c.text) for c in chunks]
     approx_tokens = [max(1, round(len(c.text) / 4)) for c in chunks]
     if not lengths:
@@ -41,7 +42,7 @@ def _compute_chunk_stats(chunks: list[Chunk]) -> dict[str, Any]:
 
 
 def _select_vector_store(dimensions: int, results_dir: Path):
-    """Use PgVectorStore if PostgreSQL is reachable; otherwise use persistent Qdrant store if configured."""
+    """Thử kết nối PostgreSQL + pgvector trước; nếu không bật Docker thì dùng Qdrant persistent trên ổ cứng."""
     load_dotenv(STARTER_DIR / ".env")
     backend_pref = os.getenv("VECTOR_STORE_BACKEND", "auto").strip().lower()
     db_url = os.getenv("DATABASE_URL", "").strip()
@@ -83,7 +84,7 @@ def _embed_with_disk_cache(
     texts: list[str],
     cache_path: Path,
 ) -> tuple[list[list[float]], float, bool]:
-    """Encode texts with real embedder; store/reuse verified cache keyed by model+sha256 for fast re-runs."""
+    """Tạo vector bằng model thật và lưu cache theo mã băm SHA256 để không phải tính lại từ đầu khi chạy lại."""
     cache_data: dict[str, list[float]] = {}
     if cache_path.exists():
         try:
@@ -119,20 +120,18 @@ def _build_coherence_samples(
     chunks_A: list[Chunk],
     chunks_B: list[Chunk],
 ) -> list[dict[str, Any]]:
-    """Select the first 10 sorted page IDs (fixed before viewing scores) for manual Chunk Coherence audit."""
+    """Lấy cố định 10 vị trí nội dung theo thứ tự page_id để chấm Chunk Coherence thủ công."""
     sorted_pages = sorted(pages, key=lambda p: str(p.metadata.get("page_id", "")))[:10]
     samples: list[dict[str, Any]] = []
 
     for pos_idx, page in enumerate(sorted_pages, start=1):
         pid = page.metadata.get("page_id")
-        # Anchor position: around character offset 350 of the normalized page text (first body transition)
         anchor_offset = min(350, max(0, len(page.text) // 3))
         anchor_snippet = page.text[anchor_offset : anchor_offset + 140].replace("\n", " ").strip()
 
         page_chunks_a = [c for c in chunks_A if c.document_id == page.document_id and c.page == page.page]
         page_chunks_b = [c for c in chunks_B if c.document_id == page.document_id and c.page == page.page]
 
-        # Pick chunk covering the anchor snippet (or chunk index 1 / 0)
         chosen_a = page_chunks_a[min(1, len(page_chunks_a) - 1)] if page_chunks_a else None
         chosen_b = page_chunks_b[min(1, len(page_chunks_b) - 1)] if page_chunks_b else None
         for ca in page_chunks_a:
@@ -168,6 +167,7 @@ def _build_coherence_samples(
 
 
 def main() -> None:
+    """Chạy toàn bộ pipeline: đọc PDF, chia chunk, tạo embedding, lưu vector store và chấm benchmark."""
     print("=" * 76)
     print("DAY 06 DATA INGESTION ENGINEERING PIPELINE & BENCHMARK EVALUATION")
     print("=" * 76)
@@ -188,7 +188,7 @@ def main() -> None:
     benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
     questions: list[dict[str, Any]] = benchmark["questions"]
 
-    # 1. Load & normalize corpus pages
+    # Đọc và chuẩn hóa các trang PDF hợp lệ theo manifest
     t_ingest0 = time.perf_counter()
     all_pages: list[DocumentPage] = []
     error_log: list[dict[str, Any]] = []
@@ -216,7 +216,7 @@ def main() -> None:
         )
     print(f"[1. Ingestion] Loaded {len(all_pages)} valid pages across {len(manifest['documents'])} PDFs in {t_ingest:.3f}s")
 
-    # Write error & exclusion log
+    # Lưu log các trang bị loại hoặc trang có dòng lỗi CMap đã được làm sạch
     err_json_path = results_dir / "ingestion_errors.json"
     err_log_path = results_dir / "ingestion_errors.log"
     err_json_path.write_text(json.dumps(error_log, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -227,7 +227,7 @@ def main() -> None:
                 f"source={ev['source']} | {ev['detail']}\n"
             )
 
-    # 2. Build chunks for Strategy A (fixed-size 500/50) and Strategy B/C (by_paragraph max_size=800)
+    # Chia chunk cho Strategy A (fixed_size 500/50) và Strategy B/C (by_paragraph max_size=800)
     t_chunk_a0 = time.perf_counter()
     chunks_A = [c for p in all_pages for c in fixed_size(p, size=500, overlap=50)]
     t_chunk_a = time.perf_counter() - t_chunk_a0
@@ -245,7 +245,7 @@ def main() -> None:
         f"               Strategy B/C (paragraph 800): {stats_B['chunk_count']} chunks (mean={stats_B['mean_chars']} chars, {t_chunk_b:.4f}s)"
     )
 
-    # 3. Initialize real semantic embedder & compute embeddings
+    # Khởi tạo model embedding và tính vector cho các chunk + câu hỏi benchmark
     model_name = os.getenv("EMBEDDING_MODEL", "google/embeddinggemma-2").strip() or "google/embeddinggemma-2"
     t_load0 = time.perf_counter()
     embedder = MyEmbedder(model_name=model_name, batch_size=8, local_files_only=True)
@@ -270,7 +270,7 @@ def main() -> None:
         embedder, [q["question"] for q in questions], cache_file
     )
 
-    # 4. Initialize Vector Store, upsert all 3 strategies, and verify idempotency
+    # Lưu vector vào store cho cả 3 chiến lược (Strategy C dùng chung bộ chunk/vector của B)
     store, store_info = _select_vector_store(dimensions=embedder.dimensions, results_dir=results_dir)
     print(f"[4. Store]     Backend: {store_info['backend']}")
 
@@ -286,7 +286,7 @@ def main() -> None:
     store.upsert("C", chunks_B, vectors_B)
     t_upsert_c = time.perf_counter() - t_up_c0
 
-    # Verify idempotency: re-upsert Strategy B and confirm count does not double
+    # Kiểm tra tính idempotent: gọi upsert lại lần 2 cho Strategy B xem tổng số bản ghi có bị nhân đôi không
     count_b_before = store.count_chunks("B")
     store.upsert("B", chunks_B, vectors_B)
     count_b_after = store.count_chunks("B")
@@ -296,7 +296,7 @@ def main() -> None:
         f"after_reingest={count_b_after}, passed={idempotent_ok}"
     )
 
-    # 5. Run retrieval & evaluation for Strategies A, B, C
+    # Truy xuất Top-3 cho 20 câu hỏi trên từng chiến lược (chỉ bật metadata filter ở Strategy C)
     all_traces: list[dict[str, Any]] = []
     traces_by_strategy: dict[str, list[dict[str, Any]]] = {"A": [], "B": [], "C": []}
     search_timings: dict[str, float] = {}
@@ -321,7 +321,7 @@ def main() -> None:
     if hasattr(store, "close"):
         store.close()
 
-    # 6. Summarize metrics and save artifacts
+    # Tổng hợp chỉ số Hit@1, Evidence Hit@3 và xuất các file trace / thống kê ra results/
     metrics_summary = summarize(all_traces)
     for strat in ["A", "B", "C"]:
         (results_dir / f"traces_{strat}.json").write_text(
@@ -416,7 +416,6 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    # Mirror JSON files into starter/results/ for compatibility
     for fname in [
         "traces_A.json",
         "traces_B.json",

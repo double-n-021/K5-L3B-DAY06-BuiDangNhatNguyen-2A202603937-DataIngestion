@@ -1,4 +1,4 @@
-"""Store and search vectors with metadata filtering using PostgreSQL + pgvector or Qdrant Persistent."""
+"""Store and search vectors using PostgreSQL + pgvector or persistent local Qdrant."""
 import json
 import uuid
 from pathlib import Path
@@ -6,13 +6,13 @@ from typing import Any
 
 from .models import Chunk
 
+# Danh sách các trường metadata cho phép đưa vào điều kiện lọc để tránh SQL injection
 ALLOWED_FILTER_KEYS = {"category", "year", "section", "document_id", "page", "source"}
 
 
 class PgVectorStore:
-    """PostgreSQL + pgvector store supporting idempotent upsert, cosine search, and SQL metadata filtering."""
-
     def __init__(self, database_url: str, dimensions: int) -> None:
+        """Retain connection settings; validate model dimensions."""
         if not database_url or not database_url.strip():
             raise ValueError("database_url must be a non-empty connection string")
         if dimensions <= 0:
@@ -32,7 +32,7 @@ class PgVectorStore:
         return self._psycopg.connect(self.database_url, connect_timeout=5)
 
     def create_schema(self) -> None:
-        """Create pgvector extension, document_chunks table, and cosine HNSW + metadata indexes."""
+        """Create table with vector column and source/page/filter metadata."""
         ddl = f"""
         CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -63,7 +63,10 @@ class PgVectorStore:
             conn.commit()
 
     def upsert(self, strategy: str, chunks: list[Chunk], vectors: list[list[float]]) -> None:
-        """Validate dimensions, remove obsolete chunks for re-ingested documents, and upsert idempotently."""
+        """Validate lengths/dimensions and write stable IDs without duplicates.
+
+        When re-ingesting changed source documents, remove obsolete chunks too.
+        """
         if not strategy or not strategy.strip():
             raise ValueError("strategy must be non-empty")
         if len(chunks) != len(vectors):
@@ -82,7 +85,7 @@ class PgVectorStore:
 
         with self._connect() as conn:
             with conn.cursor() as cur:
-                # Remove obsolete chunks belonging to re-ingested documents that are no longer in chunks
+                # Xóa các chunk cũ của tài liệu nếu nạp lại với số lượng/ranh giới chunk thay đổi
                 cur.execute(
                     """
                     DELETE FROM document_chunks
@@ -93,6 +96,7 @@ class PgVectorStore:
                     (strategy, doc_ids, chunk_ids),
                 )
 
+                # Upsert theo khóa chính (strategy, chunk_id) để chạy lại nhiều lần không bị nhân đôi bản ghi
                 upsert_sql = """
                 INSERT INTO document_chunks (
                     strategy, chunk_id, document_id, source, page,
@@ -132,7 +136,6 @@ class PgVectorStore:
             conn.commit()
 
     def count_chunks(self, strategy: str) -> int:
-        """Return total stored chunks for a given strategy."""
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -149,7 +152,10 @@ class PgVectorStore:
         top_k: int = 3,
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Filter permitted metadata in SQL, rank by cosine distance (<=>), and return top-k."""
+        """Filter permitted metadata in SQL, rank by cosine distance, return top-k.
+
+        Return chunk ID, text, score and metadata. Parameterize user-supplied values.
+        """
         if len(query_vector) != self.dimensions:
             raise ValueError(
                 f"Query vector dimension {len(query_vector)} does not match store dimension {self.dimensions}"
@@ -175,6 +181,7 @@ class PgVectorStore:
         params.extend([vec_literal, int(top_k)])
         where_sql = " AND ".join(where_clauses)
 
+        # Toán tử <=> trong pgvector là cosine distance, lấy 1 - distance để ra cosine similarity
         sql = f"""
         SELECT
             chunk_id,
@@ -211,7 +218,7 @@ class PgVectorStore:
 
 
 class QdrantPersistentStore:
-    """Persistent local Qdrant vector store with identical contract to PgVectorStore."""
+    """Vector store dùng Qdrant lưu trực tiếp trên ổ cứng local (khi máy không bật Docker PostgreSQL)."""
 
     COLLECTION_NAME = "day06_document_chunks"
 
@@ -235,7 +242,6 @@ class QdrantPersistentStore:
         self._client.close()
 
     def create_schema(self) -> None:
-        """Create persistent Qdrant collection configured with Cosine distance if not exists."""
         if not self._client.collection_exists(self.COLLECTION_NAME):
             self._client.create_collection(
                 collection_name=self.COLLECTION_NAME,
@@ -247,10 +253,10 @@ class QdrantPersistentStore:
 
     @staticmethod
     def _point_uuid(strategy: str, chunk_id: str) -> str:
+        # Sinh UUID cố định từ (strategy, chunk_id) để khi upsert lại sẽ ghi đè đúng điểm cũ
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{strategy}::{chunk_id}"))
 
     def upsert(self, strategy: str, chunks: list[Chunk], vectors: list[list[float]]) -> None:
-        """Validate lengths/dimensions, purge obsolete chunks for re-ingested docs, and upsert deterministically."""
         if not strategy or not strategy.strip():
             raise ValueError("strategy must be non-empty")
         if len(chunks) != len(vectors):
@@ -267,7 +273,7 @@ class QdrantPersistentStore:
         doc_ids = sorted({c.document_id for c in chunks})
         new_chunk_ids = {c.chunk_id for c in chunks}
 
-        # Find and delete any obsolete chunks for (strategy, doc_id) that are not in new_chunk_ids
+        # Dọn các chunk cũ của cùng (strategy, document_id) không còn nằm trong danh sách mới
         for doc_id in doc_ids:
             scroll_filter = self._qmodels.Filter(
                 must=[
@@ -323,7 +329,6 @@ class QdrantPersistentStore:
         self._client.upsert(collection_name=self.COLLECTION_NAME, points=points)
 
     def count_chunks(self, strategy: str) -> int:
-        """Count stored chunks for a strategy to verify persistence and idempotency."""
         count_res = self._client.count(
             collection_name=self.COLLECTION_NAME,
             count_filter=self._qmodels.Filter(
@@ -344,7 +349,6 @@ class QdrantPersistentStore:
         top_k: int = 3,
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Filter permitted metadata in Qdrant payload, rank by Cosine similarity, and return top-k."""
         if len(query_vector) != self.dimensions:
             raise ValueError(
                 f"Query vector dimension {len(query_vector)} does not match store dimension {self.dimensions}"

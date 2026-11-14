@@ -1,4 +1,4 @@
-"""Evaluate retrieved evidence and preserve per-query traces without conflating hit metrics with manual audits."""
+"""Evaluate retrieved evidence and preserve per-query traces."""
 import re
 from typing import Any
 
@@ -8,10 +8,10 @@ def _flat_ws(text: str) -> str:
 
 
 def evaluate_query(question: dict[str, Any], hits: list[dict[str, Any]]) -> dict[str, Any]:
-    """Check gold source/page and complete evidence per chunk; record Hit@1, Evidence Hit@3, and split-evidence diagnostics.
+    """Check source/page and enough gold evidence; keep hit@1 and hit@3 trace.
 
-    Accepts documented alternative gold pages/evidence. Does not infer human Grounding Quality
-    or Chunk Coherence labels from automated string matches.
+    Accept any documented alternative gold evidence. Do not infer human grounding
+    or chunk coherence labels from exact string match.
     """
     gold_source_id = question["gold_source_id"]
     gold_page = int(question["gold_page"])
@@ -39,11 +39,11 @@ def evaluate_query(question: dict[str, Any], hits: list[dict[str, Any]]) -> dict
         matched_anchors = [a for a in anchors if a in chunk_text_flat]
         all_anchors_in_chunk = bool(anchors) and (len(matched_anchors) == len(anchors))
 
-        # A chunk is a valid single-chunk evidence hit if it comes from the gold source/page
-        # AND contains either the full verbatim evidence quote or all required evidence anchors.
+        # Chỉ tính là Hit khi chunk thuộc đúng tài liệu + trang chuẩn VÀ chứa đủ bằng chứng trong 1 chunk đơn lẻ
         has_complete_evidence = exact_quote_in_chunk or all_anchors_in_chunk
         is_valid_hit = is_gold_source_and_page and has_complete_evidence
 
+        # Ghi nhận trường hợp lấy đúng trang vàng nhưng bằng chứng bị cắt đôi qua các chunk (hay gặp ở fixed_size)
         is_partial_split = (
             is_gold_source_and_page
             and not has_complete_evidence
@@ -118,7 +118,7 @@ def evaluate_query(question: dict[str, Any], hits: list[dict[str, Any]]) -> dict
 
 
 def summarize(traces: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate Hit@1 and Evidence Hit@3 with exact numerators/denominators (n/N) by strategy and split."""
+    """Aggregate Hit@1 and Evidence Hit@3 by strategy and dev/test split."""
     by_group: dict[tuple[str, str], list[dict[str, Any]]] = {}
     strategies = sorted({str(t.get("strategy", "default")) for t in traces})
 

@@ -1,4 +1,4 @@
-"""Real semantic embedding provider adapter using SentenceTransformers (no mock fallback)."""
+"""Choose a real embedding provider (API or local) and implement this contract."""
 import os
 from typing import Protocol
 
@@ -19,10 +19,7 @@ class Embedder(Protocol):
 
 
 class MyEmbedder:
-    """Real SentenceTransformer embedding adapter (default: google/embeddinggemma-2, 768-dim).
-
-    Strictly raises an exception if the model fails to load or encode; never falls back to mock vectors.
-    """
+    """Adapter cho model SentenceTransformers chạy local (mặc định: google/embeddinggemma-2, 768 chiều)."""
 
     def __init__(
         self,
@@ -35,6 +32,7 @@ class MyEmbedder:
         self.model_name = model_name.strip()
         self.batch_size = batch_size
 
+        # Ưu tiên load trực tiếp từ cache local trên máy để không phụ thuộc mạng khi chạy lại
         if local_files_only:
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -42,7 +40,7 @@ class MyEmbedder:
         try:
             self._model = SentenceTransformer(self.model_name, local_files_only=local_files_only)
         except Exception as exc:
-            # Retry once with network allowed if offline cache lookup failed
+            # Nếu máy chưa có sẵn cache local thì mở lại kết nối để tải model từ HuggingFace
             try:
                 os.environ.pop("HF_HUB_OFFLINE", None)
                 os.environ.pop("TRANSFORMERS_OFFLINE", None)
@@ -50,7 +48,7 @@ class MyEmbedder:
             except Exception as inner_exc:
                 raise RuntimeError(
                     f"Failed to load real embedding model '{self.model_name}'. "
-                    f"Refusing to fall back to mock vectors. Original error: {exc}"
+                    f"Original error: {exc}"
                 ) from inner_exc
 
         dim = self._model.get_sentence_embedding_dimension()
@@ -59,7 +57,7 @@ class MyEmbedder:
         self.dimensions: int = int(dim)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Encode a list of document chunks into L2-normalized semantic vectors."""
+        """Mã hóa danh sách các chunk thành vector đã chuẩn hóa L2."""
         if not texts:
             return []
         vectors = self._model.encode(
@@ -79,7 +77,7 @@ class MyEmbedder:
         return result
 
     def embed_query(self, question: str) -> list[float]:
-        """Encode a single search query into an L2-normalized semantic vector."""
+        """Mã hóa câu hỏi truy vấn thành vector chuẩn hóa L2 cùng không gian với document."""
         if not question or not question.strip():
             raise ValueError("Query string cannot be empty")
         vec = self._model.encode(

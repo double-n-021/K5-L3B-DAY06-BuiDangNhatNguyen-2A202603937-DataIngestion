@@ -1,13 +1,14 @@
-"""Implement fixed-size and structure-aware (heading/paragraph) chunking."""
+"""Implement fixed-size and structure-aware chunking."""
 import re
 from .ingestion import _HEADING_RE
 from .models import Chunk, DocumentPage
 
+# Tách câu dựa trên dấu kết câu (. ! ?) theo sau bởi khoảng trắng và chữ cái in hoa / số
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9(\[])")
 
 
 def _split_oversized_paragraph(para: str, max_size: int) -> list[str]:
-    """Split a paragraph larger than max_size along sentence boundaries first, then word boundaries."""
+    """Nếu một đoạn văn dài hơn max_size thì ưu tiên tách theo ranh giới câu thay vì cắt giữa từ."""
     if len(para) <= max_size:
         return [para]
 
@@ -29,7 +30,7 @@ def _split_oversized_paragraph(para: str, max_size: int) -> list[str]:
             if len(sent) <= max_size:
                 current = sent
             else:
-                # Fallback: split long sentence by words
+                # Trường hợp hiếm khi 1 câu đơn lẻ vẫn dài hơn max_size thì tách theo từ
                 words = sent.split(" ")
                 w_buf = ""
                 for w in words:
@@ -49,13 +50,13 @@ def _split_oversized_paragraph(para: str, max_size: int) -> list[str]:
 
 
 def fixed_size(page: DocumentPage, size: int = 500, overlap: int = 50) -> list[Chunk]:
-    """Split page text into fixed-size character windows with overlap while retaining page metadata."""
+    """Split text into overlapping windows and retain page metadata."""
     if size <= 0:
         raise ValueError("size must be positive")
     if overlap < 0 or overlap >= size:
         raise ValueError("overlap must satisfy 0 <= overlap < size")
 
-    # Flatten internal newlines to single spaces so character windows are uniform
+    # Làm phẳng xuống dòng thành khoảng trắng để trượt cửa sổ ký tự đều nhau
     flat_text = re.sub(r"\s+", " ", page.text).strip()
     if not flat_text:
         return []
@@ -96,7 +97,7 @@ def fixed_size(page: DocumentPage, size: int = 500, overlap: int = 50) -> list[C
 
 
 def by_paragraph(page: DocumentPage, max_size: int = 800) -> list[Chunk]:
-    """Group paragraphs and section headings up to max_size, splitting oversized paragraphs cleanly."""
+    """Group paragraphs, split oversized paragraphs and retain metadata."""
     if max_size <= 0:
         raise ValueError("max_size must be positive")
 
@@ -140,7 +141,7 @@ def by_paragraph(page: DocumentPage, max_size: int = 800) -> list[Chunk]:
     for para in raw_paragraphs:
         is_heading = bool(_HEADING_RE.match(para))
         if is_heading:
-            # If we already have substantial content in buffer before a new section heading, flush first
+            # Nếu buffer đã có sẵn nội dung đủ dài từ mục trước thì đóng gói thành chunk trước khi sang mục mới
             if buffer and buffer_len >= 120:
                 flush_buffer(current_section)
             current_section = para
@@ -152,7 +153,7 @@ def by_paragraph(page: DocumentPage, max_size: int = 800) -> list[Chunk]:
         for sp in sub_paras:
             candidate_len = (buffer_len + 2 + len(sp)) if buffer else len(sp)
             if candidate_len <= max_size or (len(buffer) == 1 and _HEADING_RE.match(buffer[0])):
-                # If buffer only has a heading and heading + sp slightly exceeds max_size, trim or keep together
+                # Giữ dòng heading đi kèm với đoạn văn đầu tiên ngay dưới nó để heading không bị tách lẻ
                 if candidate_len > max_size and len(buffer) == 1 and _HEADING_RE.match(buffer[0]):
                     heading_prefix = buffer[0]
                     buffer = []

@@ -1,4 +1,4 @@
-"""Read and normalize source data while preserving lineage and logging extraction issues."""
+"""Read and normalize source data."""
 import re
 import unicodedata
 from pathlib import Path
@@ -8,10 +8,10 @@ from pypdf import PdfReader
 
 from .models import DocumentPage
 
-# Control characters (excluding \t, \n, \r) that indicate broken PDF figure CMap encoding
+# Bắt các ký tự điều khiển ASCII (trừ \t, \n, \r) sinh ra do lỗi bảng mã CMap ở hình vẽ PDF
 _CONTROL_CHAR_RE = re.compile(r"[\x01-\x08\x0b\x0c\x0e-\x1f]")
 
-# Section heading detector for academic / technical documents
+# Regex nhận diện dòng tiêu đề mục (Abstract, 1 Introduction, 3.1 Setup, Appendix A...)
 _HEADING_RE = re.compile(
     r"^(?:"
     r"Abstract|ABSTRACT|"
@@ -21,7 +21,7 @@ _HEADING_RE = re.compile(
     r")$"
 )
 
-# Normalize spaced-out ICLR headings (e.g., "1 I NTRODUCTION" -> "1 Introduction")
+# File PDF của ICLR (bài ReAct) khi đọc qua pypdf bị giãn cách chữ cái đầu ở các heading
 _ICLR_SPACED_HEADING_MAP = {
     "1 I NTRODUCTION": "1 Introduction",
     "2 REAC T: S YNERGIZING REASONING + AC TING": "2 ReAct: Synergizing Reasoning + Acting",
@@ -45,19 +45,19 @@ _ICLR_SPACED_HEADING_MAP = {
 
 
 def normalize_text(text: str) -> str:
-    """Normalize Unicode, clean PDF boilerplate/garbled figure tokens, and preserve paragraph structure."""
+    """Normalize Unicode and whitespace without discarding useful structure."""
     if not text:
         return ""
 
-    # 1. Unicode NFKC (resolves typographic ligatures like ﬁ -> fi, ﬂ -> fl) followed by canonical NFC
+    # Dùng NFKC trước để tách các chữ ghép ligature (ﬁ -> fi, ﬂ -> fl) của LaTeX, sau đó đưa về NFC
     text = unicodedata.normalize("NFKC", text)
     text = unicodedata.normalize("NFC", text)
 
-    # 2. Remove null bytes, soft hyphens, and normalize non-breaking spaces and line endings
+    # Xóa byte rỗng, dấu gạch mềm (soft hyphen) và đồng nhất kiểu xuống dòng
     text = text.replace("\x00", "").replace("\u00a0", " ").replace("\u00ad", "")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # 3. Strip lines polluted by broken PDF figure CMap control characters (\x01..\x1f)
+    # Lọc bỏ các dòng bị lỗi font từ hình vẽ nhúng (như Figure 1, 4, 5 trong bài ReAct)
     clean_raw_lines: list[str] = []
     for raw_line in text.split("\n"):
         if _CONTROL_CHAR_RE.search(raw_line):
@@ -65,7 +65,7 @@ def normalize_text(text: str) -> str:
         clean_raw_lines.append(raw_line)
     text = "\n".join(clean_raw_lines)
 
-    # 4. Remove recurring conference / arXiv headers and permission boilerplates
+    # Xóa các dòng watermark/header hội nghị lặp lại ở đầu trang và câu bản quyền ở chân trang
     text = re.sub(r"Published as a conference paper at ICLR 2023\s*", "", text)
     text = re.sub(
         r"Provided proper attribution is provided, Google hereby grants permission to\s*"
@@ -76,10 +76,10 @@ def normalize_text(text: str) -> str:
     )
     text = re.sub(r"arXiv:\d{4}\.\d{4,5}v\d+\s*\[[^\]]+\]\s*\d+\s+[A-Za-z]+\s+\d{4}\s*", "", text)
 
-    # 5. Rejoin hyphenated words broken across line wraps (e.g. "transduc-\ntion" -> "transduction")
+    # Nối lại các từ bị gạch ngang ngắt dòng ở cuối lề phải (vd: "transduc-\ntion" -> "transduction")
     text = re.sub(r"([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})", r"\1\2", text)
 
-    # 6. Clean horizontal whitespace and standalone page number lines
+    # Gom khoảng trắng thừa trên từng dòng, bỏ dòng chỉ chứa số trang và chuẩn hóa lại heading ICLR
     lines: list[str] = []
     for raw_line in text.split("\n"):
         line = re.sub(r"[ \t]+", " ", raw_line).strip()
@@ -89,7 +89,7 @@ def normalize_text(text: str) -> str:
             line = _ICLR_SPACED_HEADING_MAP[line]
         lines.append(line)
 
-    # 7. Reconstruct paragraph boundaries around headings and sentence-terminal short lines
+    # Tái tạo lại dấu ngắt đoạn (\n\n) quanh các dòng tiêu đề mục và chú thích bảng/hình
     rebuilt: list[str] = []
     for line in lines:
         if not line:
@@ -105,6 +105,7 @@ def normalize_text(text: str) -> str:
         else:
             rebuilt.append(line)
 
+    # Gom các dòng thuộc cùng một đoạn văn; nếu dòng ngắn kết thúc bằng dấu chấm câu thì ngắt đoạn
     paragraphs: list[str] = []
     buf: list[str] = []
     for line in rebuilt:
@@ -126,7 +127,7 @@ def normalize_text(text: str) -> str:
 
 
 def extract_page_section(normalized_text: str, default_section: str = "Overview") -> str:
-    """Detect the primary section heading present on a page, or keep the previous active section."""
+    """Lấy tiêu đề mục xuất hiện trên trang; nếu trang không có mục mới thì giữ mục của trang trước."""
     for para in normalized_text.split("\n\n"):
         line = para.strip()
         if _HEADING_RE.match(line):
@@ -142,7 +143,10 @@ def load_pdf(
     base_metadata: dict[str, Any] | None = None,
     error_log: list[dict[str, Any]] | None = None,
 ) -> list[DocumentPage]:
-    """Extract each physical page, keep its page number and source, and log empty/excluded/noisy pages."""
+    """Extract each physical page; keep its page number and source.
+
+    Detect and record pages with no text. OCR, when needed, is a separate step.
+    """
     if not path.exists():
         raise FileNotFoundError(f"PDF file not found: {path}")
 
@@ -165,6 +169,7 @@ def load_pdf(
                 })
             continue
 
+        # Ghi nhận nếu gặp trang trống không có text
         if not raw_text.strip():
             if error_log is not None:
                 error_log.append({
@@ -176,6 +181,7 @@ def load_pdf(
                 })
             continue
 
+        # Bỏ qua các trang không thuộc nội dung chính (References, Visualization, Prompt dump) theo manifest
         if valid_pages is not None and page_idx not in valid_pages:
             if error_log is not None:
                 error_log.append({
@@ -187,7 +193,7 @@ def load_pdf(
                 })
             continue
 
-        # Detect and log if embedded vector figures contained broken CMap control characters
+        # Kiểm tra và ghi log nếu trang có các dòng rác từ hình vẽ bị lỗi bảng mã CMap
         garbled_lines = [ln for ln in raw_text.splitlines() if _CONTROL_CHAR_RE.search(ln)]
         if garbled_lines and error_log is not None:
             error_log.append({
